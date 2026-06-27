@@ -41,7 +41,7 @@ const MOCK_SCHEDULE = [
   {id:"s3",date:`${thisYear}-04-12`,courseId:"c3",teeTime:"07:30",notes:"",format:"stableford"},
   {id:"s4",date:`${thisYear}-05-10`,courseId:"c4",teeTime:"07:00",notes:"Mother's Day event",format:"stableford"},
   {id:"s5",date:`${thisYear}-06-14`,courseId:"c1",teeTime:"07:30",notes:"",format:"stroke"},
-  {id:"s6",date:`${thisYear}-06-28`,courseId:"c2",teeTime:"07:00",notes:"Midyear trophy",format:"stableford"},
+  {id:"s6",date:`${thisYear}-06-28`,courseId:"c5",teeTime:"07:00",notes:"Midyear trophy",format:"stableford"},
   {id:"s7",date:`${thisYear}-07-19`,courseId:"c3",teeTime:"07:30",notes:"",format:"stableford"},
   {id:"s8",date:`${thisYear}-08-16`,courseId:"c4",teeTime:"07:00",notes:"",format:"stroke"},
   {id:"s9",date:`${thisYear}-09-20`,courseId:"c1",teeTime:"07:30",notes:"",format:"stableford"},
