@@ -148,7 +148,7 @@ function FormatTag({format}){
 }
 
 // ─── AUTH ─────────────────────────────────────────────────────────────────────
-function Auth(){
+function Auth({notice}){
   const[email,setE]=useState("");const[pw,setPw]=useState("");const[err,setErr]=useState("");
   const[busy,setBusy]=useState(false);
 
@@ -182,7 +182,7 @@ function Auth(){
       {/* Login card */}
       <div style={{background:G.white,borderRadius:20,padding:28,width:"100%",maxWidth:380,boxShadow:"0 20px 60px rgba(0,0,0,0.5)"}}>
         <h2 style={{fontSize:20,fontWeight:800,margin:"0 0 18px",color:G.green}}>Member Sign In</h2>
-        {err&&<div style={{background:"#FEF2F2",border:"1px solid #FECACA",color:G.error,padding:"10px 14px",borderRadius:10,fontSize:13,marginBottom:12}}>{err}</div>}
+        {(err||notice)&&<div style={{background:"#FEF2F2",border:"1px solid #FECACA",color:G.error,padding:"10px 14px",borderRadius:10,fontSize:13,marginBottom:12}}>{err||notice}</div>}
         <label style={S.lbl}>Email</label>
         <input style={S.inp} type="email" placeholder="you@example.com" value={email} onChange={e=>{setE(e.target.value);setErr("");}}/>
         <label style={S.lbl}>Password</label>
@@ -1699,10 +1699,24 @@ export default function App(){
   // ── Session ────────────────────────────────────────────────────────────────
   // Restore any existing session on mount, then track sign-in / sign-out.
   useEffect(()=>{
-    supabase.auth.getSession().then(({data:{session}})=>{
-      setSession(session);
-      if(!session) setBooting(false);
-    });
+    // Safety net: never sit on the loading screen indefinitely. If Supabase
+    // hasn't answered within 8 seconds, drop through to the sign-in screen so
+    // there is something on screen and a way to retry.
+    const bail=setTimeout(()=>{
+      setBooting(false);
+      setLoadErr(prev=>prev||"Could not reach Supabase. Check your connection, then try signing in again.");
+    },8000);
+
+    supabase.auth.getSession()
+      .then(({data:{session}})=>{
+        setSession(session);
+        if(!session){clearTimeout(bail);setBooting(false);}
+      })
+      .catch(err=>{
+        clearTimeout(bail);
+        setBooting(false);
+        setLoadErr("Sign-in service unavailable: "+(err?.message||"unknown error"));
+      });
     const{data:{subscription}}=supabase.auth.onAuthStateChange((_e,session)=>{
       setSession(session);
       if(!session){
@@ -1710,7 +1724,7 @@ export default function App(){
         setSchedule([]);setCourses([]);setBooting(false);
       }
     });
-    return()=>subscription.unsubscribe();
+    return()=>{clearTimeout(bail);subscription.unsubscribe();};
   },[]);
 
   // ── Data loading ───────────────────────────────────────────────────────────
@@ -1941,7 +1955,7 @@ export default function App(){
     </div>
   );
 
-  if(!session) return <Auth/>;
+  if(!session) return <Auth notice={loadError}/>;
 
   if(!user) return (
     <div style={{minHeight:"100vh",background:G.green,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24,textAlign:"center",gap:14}}>
