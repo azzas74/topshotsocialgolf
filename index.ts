@@ -2,17 +2,23 @@
 // Proxies golfcourseapi.com so the API key never reaches the browser.
 // Requires the caller to be a signed-in Supabase Auth user (verify_jwt = true).
 //
-// This has already been deployed to your Supabase project. This copy is
-// here purely so it lives in version control alongside the rest of the app.
-//
 // Usage from the app:
 //   const { data, error } = await supabase.functions.invoke('golf-course-search', {
 //     body: { courseName: 'Royal Pines' }
 //   })
+//
+// Key resolution: uses the GOLF_COURSE_API_KEY environment secret if one is set
+// on the project, otherwise falls back to the key embedded below. Setting the
+// secret later overrides this with no code change required.
+//
+// NOTE: This file is a record of what is already deployed (version 2). Editing
+// it in GitHub does NOT redeploy it — Vercel only builds the frontend. To push
+// changes you must redeploy via the Supabase CLI or ask Claude to redeploy.
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 
-const GOLF_API_KEY = Deno.env.get("GOLF_COURSE_API_KEY") ?? "";
+const FALLBACK_API_KEY = "LC632TJS46WAI6RLCTOIN7MJ2Q";
+const GOLF_API_KEY = Deno.env.get("GOLF_COURSE_API_KEY") || FALLBACK_API_KEY;
 const GOLF_API_BASE = "https://api.golfcourseapi.com/v1";
 
 const corsHeaders = {
@@ -32,13 +38,6 @@ Deno.serve(async (req: Request) => {
       return new Response(
         JSON.stringify({ error: "courseName is required" }),
         { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
-    }
-
-    if (!GOLF_API_KEY) {
-      return new Response(
-        JSON.stringify({ error: "GOLF_COURSE_API_KEY secret is not configured on this project" }),
-        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
