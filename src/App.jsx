@@ -25,6 +25,8 @@ const mapMember = (r) => ({
   handicap: r.handicap ?? 0,
   aguHandicap: r.agu_handicap,
   active: r.active,
+  mustChangePassword: !!r.must_change_password,
+  archivedAt: r.archived_at,
 });
 
 const mapHole = (h) => ({
@@ -78,6 +80,25 @@ const mapRound = (r, nameById = {}) => ({
 // Permission helper — the database enforces these too, via RLS.
 const isAdminUser = (u) => u?.role === "administrator";
 const isCommitteeUser = (u) => u?.role === "committee" || u?.role === "administrator";
+
+// ─── ADMIN MEMBER OPERATIONS ──────────────────────────────────────────────────
+// Creating auth accounts and setting passwords needs the service-role key, which
+// must never reach the browser. All of it runs in the `admin-members` Edge
+// Function, which re-checks that the caller really is an Administrator.
+//
+// functions.invoke() returns a generic error on any non-2xx response and hides
+// the real message in error.context, so unwrap it — otherwise every failure
+// shows up as "Edge Function returned a non-2xx status code".
+async function callAdminMembers(body){
+  const{data,error}=await supabase.functions.invoke("admin-members",{body});
+  if(error){
+    let msg=error.message;
+    try{ const d=await error.context?.json(); if(d?.error) msg=d.error; }catch{ /* not JSON */ }
+    throw new Error(msg);
+  }
+  if(data?.error) throw new Error(data.error);
+  return data;
+}
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 function getDailyHandicap(h,cr,par,sl){return Math.round(h*(sl/113)+(cr-par));}
@@ -1617,16 +1638,188 @@ function Profile({user,rounds,members,schedule,courses,onAddHist,onDelRound,onPl
 }
 
 // ─── ADMIN ────────────────────────────────────────────────────────────────────
-function Admin({members,rounds,schedule,courses,onUpdateHcp,onAddHist,onDelRound,onAddEvent,onEditEvent,onDelEvent,onAddCourse,onEditCourse}){
+// ─── FORCED PASSWORD CHANGE ───────────────────────────────────────────────────
+// Shown instead of the app when an Administrator has issued a temporary
+// password. Order matters below: the new password is set first, and only then
+// is the flag cleared — reversed, a failed password update would let the member
+// straight in on the temporary one.
+function ForcePasswordChange({user,onDone}){
+  const[pw1,setP1]=useState("");const[pw2,setP2]=useState("");
+  const[err,setErr]=useState("");const[busy,setBusy]=useState(false);
+
+  const go=async()=>{
+    if(pw1.length<8){setErr("Your new password must be at least 8 characters.");return;}
+    if(pw1!==pw2){setErr("The two passwords do not match.");return;}
+    setErr("");setBusy(true);
+    try{
+      const{error:pErr}=await supabase.auth.updateUser({password:pw1});
+      if(pErr) throw pErr;
+      const{error:rErr}=await supabase.rpc("complete_password_change");
+      if(rErr) throw rErr;
+      await onDone();
+    }catch(e){
+      setErr(e.message||"Could not change your password. Please try again.");
+      setBusy(false);
+    }
+  };
+
+  return(
+    <div style={{minHeight:"100vh",background:G.green,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24}}>
+      <img src={LOGO_B64} alt="Top Shot Social Golf Club" style={{width:120,height:120,objectFit:"contain",borderRadius:14,marginBottom:20}}/>
+      <div style={{background:G.white,borderRadius:20,padding:28,width:"100%",maxWidth:380,boxShadow:"0 20px 60px rgba(0,0,0,0.5)"}}>
+        <h2 style={{fontSize:20,fontWeight:800,margin:"0 0 6px",color:G.green}}>Choose a new password</h2>
+        <p style={{fontSize:13,color:G.muted,margin:"0 0 18px",lineHeight:1.5}}>
+          Hi {user.name.split(" ")[0]} — you're signed in with a temporary password. Set your own before you continue.
+        </p>
+        {err&&<div style={{background:"#FEF2F2",border:"1px solid #FECACA",color:G.error,padding:"10px 14px",borderRadius:10,fontSize:13,marginBottom:12}}>{err}</div>}
+        <label style={S.lbl}>New password</label>
+        <input style={S.inp} type="password" placeholder="At least 8 characters" value={pw1} onChange={e=>{setP1(e.target.value);setErr("");}}/>
+        <label style={S.lbl}>Confirm new password</label>
+        <input style={S.inp} type="password" placeholder="Type it again" value={pw2} onChange={e=>{setP2(e.target.value);setErr("");}} onKeyDown={e=>e.key==="Enter"&&go()}/>
+        <button style={{...S.btn,...S.bP,marginTop:4,opacity:busy?0.6:1}} onClick={go} disabled={busy}>{busy?"Saving…":"Save & Continue"}</button>
+        <div style={{borderTop:`1px solid ${G.sandDark}`,marginTop:18,paddingTop:14,textAlign:"center"}}>
+          <button style={{background:"none",border:"none",color:G.muted,fontSize:12,cursor:"pointer",textDecoration:"underline"}} onClick={()=>supabase.auth.signOut()}>Sign out instead</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── MEMBER ADD / EDIT ────────────────────────────────────────────────────────
+function MemberModal({member,onSave,onClose}){
+  const isNew=!member;
+  const[name,setName]=useState(member?.name??"");
+  const[email,setEmail]=useState(member?.email??"");
+  const[hcp,setHcp]=useState(member?String(member.handicap):"");
+  const[role,setRole]=useState(member?.role??"player");
+  const[err,setErr]=useState("");const[busy,setBusy]=useState(false);
+
+  const go=async()=>{
+    if(!name.trim()){setErr("Enter the member's name.");return;}
+    const h=hcp===""?null:parseFloat(hcp);
+    if(h!==null&&(isNaN(h)||h<0||h>54)){setErr("Handicap must be a number between 0 and 54.");return;}
+    setErr("");setBusy(true);
+    try{
+      if(isNew){
+        await onSave({action:"create",name:name.trim(),email:email.trim()||null,handicap:h,role});
+      }else{
+        const patch={action:"update",memberId:member.id,name:name.trim(),handicap:h,role};
+        // Only send the email when it actually changed — otherwise every save
+        // would fire a pointless Auth email update.
+        if((email.trim().toLowerCase())!==((member.email??"").toLowerCase())) patch.email=email.trim()||null;
+        await onSave(patch);
+      }
+      onClose();
+    }catch(e){ setErr(e.message); setBusy(false); }
+  };
+
+  return(
+    <div style={S.modal}><div style={S.mBox}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+        <h3 style={{margin:0,fontSize:18,fontWeight:800}}>{isNew?"Add Member":"Edit Member"}</h3>
+        <button style={{background:"none",border:"none",fontSize:22,cursor:"pointer"}} onClick={onClose}>✕</button>
+      </div>
+      {err&&<div style={{background:"#FEF2F2",border:"1px solid #FECACA",color:G.error,padding:"10px 14px",borderRadius:10,fontSize:13,marginBottom:12}}>{err}</div>}
+
+      <label style={S.lbl}>Full name</label>
+      <input style={S.inp} value={name} onChange={e=>{setName(e.target.value);setErr("");}} placeholder="e.g. Barry Robertson"/>
+
+      <label style={S.lbl}>Email {isNew&&<span style={{textTransform:"none",fontWeight:500,letterSpacing:0}}>— leave blank for a member with no sign-in</span>}</label>
+      <input style={S.inp} type="email" value={email} onChange={e=>{setEmail(e.target.value);setErr("");}} placeholder="you@example.com"/>
+
+      <label style={S.lbl}>Handicap (0–54)</label>
+      <input style={S.inp} type="number" step="0.1" min="0" max="54" value={hcp} onChange={e=>{setHcp(e.target.value);setErr("");}} placeholder="e.g. 21.3"/>
+
+      <label style={S.lbl}>Role</label>
+      <select style={S.inp} value={role} onChange={e=>setRole(e.target.value)}>
+        <option value="player">Player</option>
+        <option value="committee">Committee</option>
+        <option value="administrator">Administrator</option>
+      </select>
+
+      <div style={{display:"flex",gap:10,marginTop:4}}>
+        <button style={{...S.btn,...S.bS,flex:1}} onClick={onClose}>Cancel</button>
+        <button style={{...S.btn,...S.bP,flex:1,opacity:busy?0.6:1}} onClick={go} disabled={busy}>{busy?"Saving…":"Save"}</button>
+      </div>
+    </div></div>
+  );
+}
+
+// ─── TEMPORARY PASSWORD ───────────────────────────────────────────────────────
+// Shown once, right after a reset. Supabase stores only a hash, so this is the
+// single opportunity to read it — there is no way to look it up later.
+function TempPasswordModal({info,onClose}){
+  const[copied,setCopied]=useState(false);
+  const copy=async()=>{
+    try{ await navigator.clipboard.writeText(info.password); setCopied(true); setTimeout(()=>setCopied(false),2000); }
+    catch{ /* clipboard blocked — the member can read it off the screen */ }
+  };
+  return(
+    <div style={S.modal}><div style={S.mBox}>
+      <h3 style={{margin:"0 0 6px",fontSize:18,fontWeight:800}}>Temporary password</h3>
+      <p style={{fontSize:13,color:G.muted,margin:"0 0 16px",lineHeight:1.5}}>
+        Give this to {info.name}. They'll be asked to choose their own password the next time they sign in.
+      </p>
+      <div style={{background:G.sand,border:`1.5px dashed ${G.sandDark}`,borderRadius:12,padding:"18px 14px",textAlign:"center",marginBottom:12}}>
+        <div style={{fontSize:24,fontWeight:900,letterSpacing:"1px",color:G.green,fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace"}}>{info.password}</div>
+      </div>
+      <div style={{background:"#FFFBEB",border:"1px solid #FDE68A",borderRadius:10,padding:"10px 14px",fontSize:12,color:"#92400E",marginBottom:14,lineHeight:1.5}}>
+        ⚠️ This is the only time it will be shown. Write it down before closing.
+      </div>
+      <div style={{display:"flex",gap:10}}>
+        <button style={{...S.btn,...S.bS,flex:1}} onClick={copy}>{copied?"✓ Copied":"Copy"}</button>
+        <button style={{...S.btn,...S.bP,flex:1}} onClick={onClose}>Done</button>
+      </div>
+    </div></div>
+  );
+}
+
+function Admin({members,rounds,schedule,courses,currentUserId,onUpdateHcp,onSaveMember,onArchiveMember,onRestoreMember,onResetPassword,onAddHist,onDelRound,onAddEvent,onEditEvent,onDelEvent,onAddCourse,onEditCourse}){
   const[selM,setSelM]=useState(null);const[newHcp,setNH]=useState("");const[tab,setTab]=useState("members");
+  const[editM,setEditM]=useState(null);        // member being added/edited (null = closed, "new" = add)
+  const[tempPw,setTempPw]=useState(null);      // {name,password} after a reset
+  const[showArchived,setShowArch]=useState(false);
+  const[busyId,setBusyId]=useState(null);
   const save=()=>{const v=parseFloat(newHcp);if(!isNaN(v)&&v>=0&&v<=54){onUpdateHcp(selM.id,v);setSelM(null);setNH("");}};
   const allR=[...rounds].sort((a,b)=>new Date(b.date)-new Date(a.date));
+
+  const active=members.filter(m=>m.active);
+  const archived=members.filter(m=>!m.active);
+  const shown=showArchived?archived:active;
+
+  const doSaveMember=async(payload)=>{
+    const res=await onSaveMember(payload);
+    if(res?.tempPassword) setTempPw({name:res.member?.name??payload.name,password:res.tempPassword});
+  };
+
+  const doReset=async(m)=>{
+    if(!window.confirm(`Issue a temporary password for ${m.name}? Their current password stops working immediately.`)) return;
+    setBusyId(m.id);
+    try{
+      const res=await onResetPassword(m.id);
+      setTempPw({name:m.name,password:res.tempPassword});
+    }catch(e){ alert(e.message); }
+    finally{ setBusyId(null); }
+  };
+
+  const doArchive=async(m)=>{
+    if(!window.confirm(`Archive ${m.name}? They won't be able to sign in and will drop off the active roster. Their rounds and handicap history are kept, and you can restore them later.`)) return;
+    setBusyId(m.id);
+    try{ await onArchiveMember(m.id); }catch(e){ alert(e.message); }
+    finally{ setBusyId(null); }
+  };
+
+  const doRestore=async(m)=>{
+    setBusyId(m.id);
+    try{ await onRestoreMember(m.id); }catch(e){ alert(e.message); }
+    finally{ setBusyId(null); }
+  };
   return(
     <div style={S.page}>
       <h2 style={{fontSize:22,fontWeight:800,margin:"0 0 4px"}}>Admin Panel</h2>
       <p style={{fontSize:13,color:G.muted,margin:"0 0 14px"}}>Members, rounds & schedule</p>
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:8,marginBottom:14}}>
-        {[{l:"Members",v:members.length,i:"👥"},{l:"Rounds",v:rounds.length,i:"📋"},{l:"Scheduled",v:schedule.length,i:"📅"},{l:"Upcoming",v:schedule.filter(e=>!isPast(e.date)).length,i:"⛳"}].map(({l,v,i})=>(
+        {[{l:"Members",v:active.length,i:"👥"},{l:"Rounds",v:rounds.length,i:"📋"},{l:"Scheduled",v:schedule.length,i:"📅"},{l:"Upcoming",v:schedule.filter(e=>!isPast(e.date)).length,i:"⛳"}].map(({l,v,i})=>(
           <div key={l} style={{...S.card,textAlign:"center",padding:"12px 6px"}}>
             <div style={{fontSize:18,marginBottom:3}}>{i}</div>
             <div style={{fontSize:20,fontWeight:900,color:G.green}}>{v}</div>
@@ -1640,26 +1833,58 @@ function Admin({members,rounds,schedule,courses,onUpdateHcp,onAddHist,onDelRound
         ))}
       </div>
 
-      {tab==="members"&&members.map(m=>{
-        const mr=rounds.filter(r=>r.userId===m.id);const agu=calcAGUHandicap(mr);const latest=mr.sort((a,b)=>new Date(b.date)-new Date(a.date))[0];
-        return(<div key={m.id} style={{...S.card,padding:"14px 16px"}}>
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
-            <div style={{flex:1}}>
-              <div style={{fontWeight:700,fontSize:15}}>{m.name}</div>
-              <div style={{fontSize:12,color:G.muted,marginTop:2}}>{m.email}</div>
-              <div style={{display:"flex",gap:6,marginTop:8,flexWrap:"wrap"}}>
-                <span style={{...S.tag,background:G.sand,color:G.green,border:`1px solid ${G.sandDark}`}}>Hcp {m.handicap}</span>
-                {agu!=null&&<span style={{...S.tag,background:`${G.green}15`,color:G.greenMid}}>AGU {agu}</span>}
-                <span style={{...S.tag,background:G.sand,color:G.muted,border:`1px solid ${G.sandDark}`}}>{mr.length} rounds</span>
-                {m.role==="administrator"&&<span style={{...S.tag,background:G.coral,color:G.white}}>Admin</span>}
-                {m.role==="committee"&&<span style={{...S.tag,background:G.greenMid,color:G.white}}>Committee</span>}
-              </div>
-            </div>
-            <button style={{padding:"7px 12px",borderRadius:9,border:`1.5px solid ${G.green}`,background:G.white,color:G.green,fontWeight:700,fontSize:12,cursor:"pointer"}} onClick={()=>{setSelM(m);setNH(String(m.handicap));}}>Edit Hcp</button>
+      {tab==="members"&&(<>
+        <button style={{...S.btn,...S.bP,marginBottom:12}} onClick={()=>setEditM("new")}>+ Add Member</button>
+
+        <div style={{display:"flex",gap:6,marginBottom:12}}>
+          {[{k:false,l:`Active (${active.length})`},{k:true,l:`Archived (${archived.length})`}].map(({k,l})=>(
+            <button key={String(k)} style={{flex:1,padding:"8px 0",borderRadius:9,border:`1.5px solid ${showArchived===k?G.green:G.sandDark}`,background:showArchived===k?G.green:G.white,color:showArchived===k?G.white:G.muted,fontWeight:700,fontSize:12,cursor:"pointer"}} onClick={()=>setShowArch(k)}>{l}</button>
+          ))}
+        </div>
+
+        {shown.length===0&&(
+          <div style={{...S.card,textAlign:"center",padding:"40px 20px"}}>
+            <div style={{fontSize:36,marginBottom:10}}>{showArchived?"📦":"👥"}</div>
+            <div style={{fontSize:15,fontWeight:700}}>{showArchived?"No archived members":"No members yet"}</div>
           </div>
-          {latest&&<div style={{marginTop:10,paddingTop:10,borderTop:`1px solid ${G.sandDark}`,fontSize:12,color:G.muted}}>Last: {latest.courseName} · {new Date(latest.date).toLocaleDateString("en-AU")} · Diff {latest.scoreDiff?.toFixed(2)}</div>}
-        </div>);
-      })}
+        )}
+
+        {shown.map(m=>{
+          const mr=rounds.filter(r=>r.userId===m.id);const agu=calcAGUHandicap(mr);const latest=mr.sort((a,b)=>new Date(b.date)-new Date(a.date))[0];
+          const isSelf=m.id===currentUserId;const busy=busyId===m.id;
+          return(<div key={m.id} style={{...S.card,padding:"14px 16px",opacity:m.active?1:0.72}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10}}>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontWeight:700,fontSize:15}}>{m.name}{isSelf&&<span style={{fontSize:11,color:G.muted,fontWeight:600}}> · you</span>}</div>
+                <div style={{fontSize:12,color:G.muted,marginTop:2,overflowWrap:"anywhere"}}>{m.email||<em>No email — cannot sign in</em>}</div>
+                <div style={{display:"flex",gap:6,marginTop:8,flexWrap:"wrap"}}>
+                  <span style={{...S.tag,background:G.sand,color:G.green,border:`1px solid ${G.sandDark}`}}>Hcp {m.handicap}</span>
+                  {agu!=null&&<span style={{...S.tag,background:`${G.green}15`,color:G.greenMid}}>AGU {agu}</span>}
+                  <span style={{...S.tag,background:G.sand,color:G.muted,border:`1px solid ${G.sandDark}`}}>{mr.length} rounds</span>
+                  {m.role==="administrator"&&<span style={{...S.tag,background:G.coral,color:G.white}}>Admin</span>}
+                  {m.role==="committee"&&<span style={{...S.tag,background:G.greenMid,color:G.white}}>Committee</span>}
+                  {m.mustChangePassword&&<span style={{...S.tag,background:"#FEF3C7",color:"#92400E",border:"1px solid #FDE68A"}}>🔑 Temp password</span>}
+                  {!m.active&&<span style={{...S.tag,background:"#E5E7EB",color:"#4B5563"}}>Archived</span>}
+                </div>
+              </div>
+              <button style={{padding:"7px 12px",borderRadius:9,border:`1.5px solid ${G.green}`,background:G.white,color:G.green,fontWeight:700,fontSize:12,cursor:"pointer",flexShrink:0}} onClick={()=>{setSelM(m);setNH(String(m.handicap));}}>Edit Hcp</button>
+            </div>
+
+            {latest&&<div style={{marginTop:10,paddingTop:10,borderTop:`1px solid ${G.sandDark}`,fontSize:12,color:G.muted}}>Last: {latest.courseName} · {new Date(latest.date).toLocaleDateString("en-AU")} · Diff {latest.scoreDiff?.toFixed(2)}</div>}
+
+            <div style={{display:"flex",gap:6,marginTop:10,paddingTop:10,borderTop:`1px solid ${G.sandDark}`,flexWrap:"wrap"}}>
+              <button style={{flex:1,minWidth:78,padding:"8px 6px",borderRadius:9,border:`1.5px solid ${G.sandDark}`,background:G.sand,color:G.green,fontWeight:700,fontSize:12,cursor:"pointer",opacity:busy?0.5:1}} disabled={busy} onClick={()=>setEditM(m)}>✏️ Edit</button>
+              {m.active&&(
+                <button style={{flex:1,minWidth:78,padding:"8px 6px",borderRadius:9,border:"1.5px solid #BFDBFE",background:G.sky,color:G.blue,fontWeight:700,fontSize:12,cursor:m.email?"pointer":"not-allowed",opacity:busy||!m.email?0.5:1}} disabled={busy||!m.email} onClick={()=>doReset(m)} title={m.email?"":"This member has no sign-in account"}>🔑 Reset</button>
+              )}
+              {m.active
+                ?<button style={{flex:1,minWidth:78,padding:"8px 6px",borderRadius:9,border:"1px solid #FECACA",background:"#FEE2E2",color:G.error,fontWeight:700,fontSize:12,cursor:isSelf?"not-allowed":"pointer",opacity:busy||isSelf?0.5:1}} disabled={busy||isSelf} onClick={()=>doArchive(m)} title={isSelf?"You cannot archive your own account":""}>📦 Archive</button>
+                :<button style={{flex:1,minWidth:78,padding:"8px 6px",borderRadius:9,border:`1.5px solid ${G.green}`,background:G.white,color:G.green,fontWeight:700,fontSize:12,cursor:"pointer",opacity:busy?0.5:1}} disabled={busy} onClick={()=>doRestore(m)}>↩️ Restore</button>
+              }
+            </div>
+          </div>);
+        })}
+      </>)}
 
       {tab==="rounds"&&(<>
         {allR.length===0&&<div style={{...S.card,textAlign:"center",padding:"40px 20px"}}><div style={{fontSize:36,marginBottom:10}}>📋</div><div style={{fontSize:15,fontWeight:700}}>No rounds yet</div></div>}
@@ -1696,6 +1921,9 @@ function Admin({members,rounds,schedule,courses,onUpdateHcp,onAddHist,onDelRound
           </div>
         </div></div>
       )}
+
+      {editM&&<MemberModal member={editM==="new"?null:editM} onSave={doSaveMember} onClose={()=>setEditM(null)}/>}
+      {tempPw&&<TempPasswordModal info={tempPw} onClose={()=>setTempPw(null)}/>}
     </div>
   );
 }
@@ -1773,8 +2001,18 @@ export default function App(){
       // Match the signed-in auth user to their member record.
       const me=mems.find(m=>m.authUserId===session.user.id)
              ??mems.find(m=>(m.email??"").toLowerCase()===(session.user.email??"").toLowerCase());
-      if(me) setUser(me);
-      else setLoadErr("Your sign-in worked, but no member record is linked to this account. Contact the club administrator.");
+
+      if(!me){
+        setLoadErr("Your sign-in worked, but no member record is linked to this account. Contact the club administrator.");
+      }else if(!me.active){
+        // Archived members are also banned in Auth, but a session issued before
+        // archiving would otherwise stay alive until it expired.
+        setUser(null);
+        await supabase.auth.signOut();
+        setLoadErr("This membership has been archived. Contact the club administrator.");
+      }else{
+        setUser(me);
+      }
     }catch(e){
       setLoadErr(e.message||"Could not load club data.");
     }finally{
@@ -1866,6 +2104,33 @@ export default function App(){
       if(error) throw error;
       await refreshAll();
     }catch(e){ alert("Could not update the handicap: "+e.message); }
+  };
+
+  // ── Member administration ──────────────────────────────────────────────────
+  // These all go through the admin-members Edge Function. Errors are thrown
+  // rather than alerted so the calling form can show them inline; the caller
+  // re-reads the data afterwards.
+
+  const handleSaveMember=async(payload)=>{
+    const res=await callAdminMembers(payload);
+    await refreshAll();
+    return res;
+  };
+
+  const handleResetPassword=async(memberId)=>{
+    const res=await callAdminMembers({action:"reset_password",memberId});
+    await refreshAll();
+    return res;
+  };
+
+  const handleArchiveMember=async(memberId)=>{
+    await callAdminMembers({action:"archive",memberId});
+    await refreshAll();
+  };
+
+  const handleRestoreMember=async(memberId)=>{
+    await callAdminMembers({action:"restore",memberId});
+    await refreshAll();
   };
 
   const toEventRow=(event)=>({
@@ -1985,6 +2250,14 @@ export default function App(){
 
   const me=members.find(m=>m.id===user.id)??user;
 
+  // A temporary password gets you as far as this screen and no further.
+  if(me.mustChangePassword) return <ForcePasswordChange user={me} onDone={refreshAll}/>;
+
+  // Archived members keep their rounds so history stays intact, but they should
+  // not appear on the leaderboard or in team selection. The Admin panel gets the
+  // full list so they can be reviewed and restored.
+  const activeMembers=members.filter(m=>m.active);
+
   const hdrSub={home:`Welcome back, ${user.name.split(" ")[0]}`,schedule:"Season schedule",play:"Choose a course",leaderboard:"Club standings",profile:"Your profile & stats",admin:"Club management"};
 
   return(
@@ -2094,16 +2367,16 @@ export default function App(){
         </div>
       )}
 
-      {tab==="schedule"&&<ScheduleScreen schedule={schedule} courses={courses} members={members} isAdmin={isAdminUser(user)} onPlay={c=>{setAR({course:c});setTab("scoring");}} onAddEvent={handleAddEvent} onEditEvent={handleAddEvent} onDeleteEvent={handleDelEvent} onAddCourse={handleAddCourse} onEditCourse={handleEditCourse}/>}
+      {tab==="schedule"&&<ScheduleScreen schedule={schedule} courses={courses} members={activeMembers} isAdmin={isAdminUser(user)} onPlay={c=>{setAR({course:c});setTab("scoring");}} onAddEvent={handleAddEvent} onEditEvent={handleAddEvent} onDeleteEvent={handleDelEvent} onAddCourse={handleAddCourse} onEditCourse={handleEditCourse}/>}
       {tab==="play"&&(isCommitteeUser(user)
         ?<AdminCourseSearch onSelect={c=>{setAR({course:c});setTab("scoring");}} schedule={schedule} courses={courses} role={user.role}/>
         :<MemberPlay onSelect={c=>{setAR({course:c});setTab("scoring");}} schedule={schedule} courses={courses}/>
       )}
       {tab==="scoring"&&activeRound&&<Scoring user={me} course={activeRound.course} onFinish={handleRoundFinish}/>}
       {tab==="complete"&&completedRound&&<RoundComplete round={completedRound} user={me} onDone={()=>{setCR(null);setTab("home");}}/>}
-      {tab==="leaderboard"&&<Leaderboard members={members} rounds={rounds} isAdmin={isAdminUser(user)} schedule={schedule} courses={courses}/>}
-      {tab==="profile"&&<Profile user={me} rounds={rounds} members={members} schedule={schedule} courses={courses} onAddHist={handleAddHist} onDelRound={handleDelRound} onPlay={c=>{setAR({course:c});setTab("scoring");}}/>}
-      {tab==="admin"&&isAdminUser(user)&&<Admin members={members} rounds={rounds} schedule={schedule} courses={courses} onUpdateHcp={handleUpdateHcp} onAddHist={handleAddHist} onDelRound={handleDelRound} onAddEvent={handleAddEvent} onEditEvent={handleAddEvent} onDelEvent={handleDelEvent} onAddCourse={handleAddCourse} onEditCourse={handleEditCourse}/>}
+      {tab==="leaderboard"&&<Leaderboard members={activeMembers} rounds={rounds} isAdmin={isAdminUser(user)} schedule={schedule} courses={courses}/>}
+      {tab==="profile"&&<Profile user={me} rounds={rounds} members={activeMembers} schedule={schedule} courses={courses} onAddHist={handleAddHist} onDelRound={handleDelRound} onPlay={c=>{setAR({course:c});setTab("scoring");}}/>}
+      {tab==="admin"&&isAdminUser(user)&&<Admin members={members} rounds={rounds} schedule={schedule} courses={courses} currentUserId={user.id} onUpdateHcp={handleUpdateHcp} onSaveMember={handleSaveMember} onArchiveMember={handleArchiveMember} onRestoreMember={handleRestoreMember} onResetPassword={handleResetPassword} onAddHist={handleAddHist} onDelRound={handleDelRound} onAddEvent={handleAddEvent} onEditEvent={handleAddEvent} onDelEvent={handleDelEvent} onAddCourse={handleAddCourse} onEditCourse={handleEditCourse}/>}
 
       {!["scoring","complete"].includes(tab)&&(
         <nav style={S.nav}>
