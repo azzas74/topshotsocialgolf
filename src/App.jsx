@@ -452,11 +452,29 @@ function AddCourseModal({onAdd, onClose}){
     }
   };
 
+  // The GolfCourse API nests the address under a location object:
+  //   location: { address, city, state, country }
+  // e.g. Palm Meadows -> { address: "Palm Meadows Dr, Carrara QLD 4211, Australia",
+  //                        city: "Carrara", state: "QLD", country: "Australia" }
+  // Returns { suburb, address } as plain strings. Flat/legacy shapes (city and
+  // address at the top level, or location as a string) are still handled, and an
+  // object never escapes as a value — that is what produced "[object Object]".
+  const parseLocation = (r) => {
+    const L = (r?.location && typeof r.location === "object") ? r.location : {};
+    const locStr = typeof r?.location === "string" ? r.location : "";
+    const str = v => (typeof v === "string" ? v.trim() : "");
+    // Country is deliberately left off the suburb line — "Carrara, QLD" reads
+    // better on the card than "Carrara, QLD, Australia". It stays in the address.
+    const suburb = [str(L.city) || str(r?.city), str(L.state) || str(r?.state)]
+      .filter(Boolean).join(", ") || locStr;
+    const address = str(L.address) || str(r?.address) || locStr;
+    return { suburb, address };
+  };
+
   const populateFromResult = (r) => {
-    // GolfCourse API field names: club_name/course_name, location, address, course_rating, slope_rating, par
+    // GolfCourse API field names: club_name/course_name, location{...}, course_rating, slope_rating, par
     const courseName = r.club_name || r.course_name || r.name || query;
-    const loc = [r.city, r.state, r.country].filter(Boolean).join(", ") || r.location || "";
-    const addr = r.address || r.location || "";
+    const { suburb: loc, address: addr } = parseLocation(r);
     const cr = r.course_rating ?? r.rating ?? "";
     const sl = r.slope_rating ?? r.slope ?? "";
     const p  = r.par ?? 72;
@@ -621,7 +639,7 @@ function AddCourseModal({onAdd, onClose}){
             <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:12}}>
               {searchResults.map((r,i)=>{
                 const cname=r.club_name||r.course_name||r.name||`Result ${i+1}`;
-                const cloc=[r.city,r.state,r.country].filter(Boolean).join(", ")||r.location||"";
+                const {suburb:cloc,address:caddr}=parseLocation(r);
                 const cr=r.course_rating??r.rating??"—";
                 const sl=r.slope_rating??r.slope??"—";
                 const p=r.par??"—";
@@ -633,7 +651,7 @@ function AddCourseModal({onAdd, onClose}){
                   >
                     <div style={{fontWeight:700,fontSize:14,color:G.charcoal}}>{cname}</div>
                     {cloc&&<div style={{fontSize:12,color:G.muted,marginTop:2}}>📍 {cloc}</div>}
-                    {r.address&&<div style={{fontSize:11,color:G.muted,marginTop:1}}>🏠 {r.address}</div>}
+                    {caddr&&<div style={{fontSize:11,color:G.muted,marginTop:1}}>🏠 {caddr}</div>}
                     <div style={{display:"flex",gap:12,marginTop:8}}>
                       {[{l:"Par",v:p},{l:"Rating",v:cr},{l:"Slope",v:sl}].map(({l,v})=>(
                         <div key={l} style={{textAlign:"center",background:G.sand,borderRadius:8,padding:"4px 10px"}}>
